@@ -11,9 +11,12 @@ with Ada.Directories;
 
 with GNAT.SHA512;
 
-with Util.Encoders;
+with Util.Encoders.AES;
+with Util.Encoders.HMAC.SHA256;
+with Util.Encoders.SHA256;
 with Util.Files;
 with Util.Processes;
+with Util.Streams.Buffered;
 with Util.Streams.Pipes;
 
 package body Dead_Man_Hand.Decrypt is
@@ -29,9 +32,25 @@ package body Dead_Man_Hand.Decrypt is
 
    procedure ED25519_To_X25519 (Key : in out Stream_Element_Array_32);
 
-   procedure Write_X25519_Key
+   procedure Write_X25519_Private_Key
      (Name : String;
       Key  : Stream_Element_Array_32);
+
+   procedure Write_X25519_Public_Key
+     (Name : String;
+      Key  : Stream_Element_Array_32);
+
+   procedure Derive_Shared_Key
+     (Logger      : Util.Log.Loggers.Logger;
+      Private_Key : Stream_Element_Array_32;
+      Public_Key  : Stream_Element_Array_32;
+      Hex         : out String);
+
+   procedure HKDF_Derive_Keys
+     (Logger     : Util.Log.Loggers.Logger;
+      Shared_Key : String;
+      AES_Key    : out Stream_Element_Array_32;
+      HMAC_Key   : out Stream_Element_Array_32);
 
    -------------------
    -- Decode_Base64 --
@@ -74,13 +93,13 @@ package body Dead_Man_Hand.Decrypt is
       Private_Key : Stream_Element_Array_32;
       Success     : Boolean;
 
-      procedure Remove_Password;
+      procedure Remove_Password_And_Read;
 
-      ---------------------
-      -- Remove_Password --
-      ---------------------
+      ------------------------------
+      -- Remove_Password_And_Read --
+      ------------------------------
 
-      procedure Remove_Password is
+      procedure Remove_Password_And_Read is
          Pipe  : aliased Util.Streams.Pipes.Pipe_Stream;
       begin
          Ada.Directories.Copy_File
@@ -105,7 +124,27 @@ package body Dead_Man_Hand.Decrypt is
          else
             Logger.Info ("Decryption with 'ssh-keygen -p' failed!");
          end if;
-      end Remove_Password;
+      end Remove_Password_And_Read;
+
+      Bytes : constant Ada.Streams.Stream_Element_Array :=
+        Decode_Base64 (Logger, Text);
+
+      Shared_Key : String (1 .. 64);  --  hex-encoded shared key
+
+      AES_Key : Stream_Element_Array_32;
+      HMAC_Key : Stream_Element_Array_32;
+
+      function Public_Bytes return Stream_Element_Array_32 is
+        (Bytes (1 .. 32));
+
+      function IV return Ada.Streams.Stream_Element_Array is
+        (Bytes (33 .. 48));
+
+      function HMAC_Tag_Received return Ada.Streams.Stream_Element_Array is
+        (Bytes (49 .. 80));
+
+      function Payload return Ada.Streams.Stream_Element_Array is
+        (Bytes (81 .. Bytes'Length));
 
    begin
       if not Ada.Directories.Exists (Key) then
@@ -118,7 +157,7 @@ package body Dead_Man_Hand.Decrypt is
       Read_ED25519_Key (Logger, Key, Private_Key, Success);
 
       if not Success then
-         Remove_Password;
+         Remove_Password_And_Read;
       end if;
 
       if not Success then
@@ -126,6 +165,62 @@ package body Dead_Man_Hand.Decrypt is
       end if;
 
       ED25519_To_X25519 (Private_Key);
+      Derive_Shared_Key (Logger, Private_Key, Public_Bytes, Shared_Key);
+      HKDF_Derive_Keys (Logger, Shared_Key, AES_Key, HMAC_Key);
+      --  Check HMAC
+      declare
+         use type Util.Encoders.SHA256.Hash_Array;
+         Context : Util.Encoders.HMAC.SHA256.Context;
+         Hash    : Util.Encoders.SHA256.Hash_Array;
+      begin
+         Util.Encoders.HMAC.SHA256.Set_Key (Context, HMAC_Key);
+         Util.Encoders.HMAC.SHA256.Update (Context, Public_Bytes);
+         Util.Encoders.HMAC.SHA256.Update (Context, IV);
+         Util.Encoders.HMAC.SHA256.Update (Context, Payload);
+         Util.Encoders.HMAC.SHA256.Finish (Context, Hash);
+         Success := Hash = HMAC_Tag_Received;
+
+         Logger.Info
+           ("HMAC verification {0}",
+            (if Success then "succeeded" else "failed"));
+      end;
+
+      if not Success then
+         return;
+      end if;
+
+      --  Decrypt with AES-CBC
+      declare
+         use type Ada.Streams.Stream_Element_Offset;
+         Key      : Util.Encoders.Secret_Key (Length => 32);
+         IV_Key   : Util.Encoders.Secret_Key (Length => 16);
+         Decoder  : Util.Encoders.AES.Decoder;
+         Result   : Ada.Streams.Stream_Element_Array (Payload'Range);
+         Last     : Ada.Streams.Stream_Element_Offset;
+         Encoded  : Ada.Streams.Stream_Element_Offset;
+         Output   : Ada.Streams.Stream_IO.File_Type;
+      begin
+         Util.Encoders.Create (AES_Key, Key);
+         Util.Encoders.Create (IV, IV_Key);
+         Decoder.Set_Key (Key, Util.Encoders.AES.CBC);
+         Decoder.Set_IV (IV_Key);
+         Decoder.Set_Padding (Util.Encoders.AES.PKCS7_PADDING);
+         Decoder.Transform (Payload, Result, Last, Encoded);
+         Decoder.Finish (Result (Last + 1 .. Result'Last), Last);
+
+         Logger.Info
+           ("Decrypted {0} bytes with AES-CBC",
+            Ada.Streams.Stream_Element_Offset'Image (Last));
+
+         Ada.Streams.Stream_IO.Create
+           (File => Output,
+            Mode => Ada.Streams.Stream_IO.Out_File,
+            Name => "result-ed.txt");
+         Ada.Streams.Stream_IO.Write (Output, Result (Result'First .. Last));
+         Ada.Streams.Stream_IO.Close (Output);
+
+         Logger.Info ("Decryption successful! See 'result-ed.txt'");
+      end;
    end Decrypt_ED25519;
 
    -----------------
@@ -137,7 +232,6 @@ package body Dead_Man_Hand.Decrypt is
       Key      : String;
       Text     : String)
    is
-      --  Last  : Ada.Streams.Stream_Element_Offset;
       Pipe  : aliased Util.Streams.Pipes.Pipe_Stream;
       Bytes : constant Ada.Streams.Stream_Element_Array :=
         Decode_Base64 (Logger, Text);
@@ -156,7 +250,10 @@ package body Dead_Man_Hand.Decrypt is
         (Command =>
           "openssl pkeyutl -decrypt -inkey """ &
            Key &
-           """ -out result-rsa.txt",
+           """ -pkeyopt rsa_padding_mode:oaep" &
+           " -pkeyopt rsa_oaep_md:sha256" &
+           " -pkeyopt rsa_mgf1_md:sha256" &
+           " -out result-rsa.txt",
          Mode => Util.Processes.WRITE);
       Pipe.Write (Bytes);
       Pipe.Flush;
@@ -174,6 +271,63 @@ package body Dead_Man_Hand.Decrypt is
    end Decrypt_RSA;
 
    -----------------------
+   -- Derive_Shared_Key --
+   -----------------------
+
+   procedure Derive_Shared_Key
+     (Logger      : Util.Log.Loggers.Logger;
+      Private_Key : Stream_Element_Array_32;
+      Public_Key  : Stream_Element_Array_32;
+      Hex         : out String)
+   is
+      Pipe  : aliased Util.Streams.Pipes.Pipe_Stream;
+      Buffer : Util.Streams.Buffered.Input_Buffer_Stream;
+      Char : Character;
+   begin
+      Write_X25519_Private_Key ("priv.der", Private_Key);
+      Write_X25519_Public_Key ("pub.der", Public_Key);
+
+      --  Run:
+      --  openssl pkeyutl -derive -inkey priv.der -peerkey pub.der -hexdump
+      Pipe.Open
+        (Command =>
+           "openssl pkeyutl -derive -inkey priv.der -peerkey pub.der -hexdump",
+         Mode => Util.Processes.READ);
+      Buffer.Initialize (Input => Pipe'Unchecked_Access, Size => 200);
+      Buffer.Fill;
+
+      --  Parse hex dump:
+      --  0000 - 11 22 ... FF   1234567890ABCDEF \n
+      --  0010 - 11 22 ... FF   1234567890ABCDEF \n
+      --
+
+      for J in Hex'Range loop
+         if J = 33 then
+            --  Skip till ASCII and of line
+            loop
+               Buffer.Read (Char);
+               exit when Char = Ada.Characters.Latin_1.LF;
+            end loop;
+         end if;
+         if J in 1 | 33 then
+            --  Skip address offset and a dash
+            loop
+               Buffer.Read (Char);
+               exit when Char = '-';
+            end loop;
+         end if;
+         if J mod 2 = 1 then
+            --  Skip space separators
+            Buffer.Read (Char);
+            pragma Assert (Char in ' ' | '-');
+         end if;
+         Buffer.Read (Hex (J));
+      end loop;
+
+      Logger.Info ("Derived shared key: {0}", Hex);
+   end Derive_Shared_Key;
+
+   -----------------------
    -- ED25519_To_X25519 --
    -----------------------
 
@@ -181,11 +335,58 @@ package body Dead_Man_Hand.Decrypt is
       use type Ada.Streams.Stream_Element;
    begin
       --  Hash the key with SHA-512
-      Key := GNAT.SHA512.Digest (Key);
+      Key := GNAT.SHA512.Digest (Key) (1 .. 32);
       --  Clamp the key
       Key (1) := Key (1) and 16#F8#;
       Key (32) := (Key (32) and 16#7F#) or 16#40#;
    end ED25519_To_X25519;
+
+   ----------------------
+   -- HKDF_Derive_Keys --
+   ----------------------
+
+   procedure HKDF_Derive_Keys
+     (Logger     : Util.Log.Loggers.Logger;
+      Shared_Key : String;
+      AES_Key    : out Stream_Element_Array_32;
+      HMAC_Key   : out Stream_Element_Array_32)
+   is
+      Pipe  : aliased Util.Streams.Pipes.Pipe_Stream;
+      Buffer : Util.Streams.Buffered.Input_Buffer_Stream;
+      Char : Character;
+      Hex_Key : String (1 .. 128);
+      Raw : Ada.Streams.Stream_Element_Array (1 .. 64);
+
+      Decoder : constant Util.Encoders.Decoder :=
+        Util.Encoders.Create ("hex");
+   begin
+      --  Run:
+      --  openssl kdf -keylen 64 -kdfopt digest:SHA256
+      --    -kdfopt key:SHARED_KEY -kdfopt info:sealed-box-cbc-protocol HKDF
+      Pipe.Open
+        (Command =>
+           "openssl kdf -keylen 64 -kdfopt digest:SHA256 "
+           & "-kdfopt hexkey:" & Shared_Key & " "
+           & "-kdfopt info:sealed-box-cbc-protocol HKDF",
+         Mode => Util.Processes.READ);
+      Buffer.Initialize (Input => Pipe'Unchecked_Access, Size => 200);
+      Buffer.Fill;
+
+      for J in Hex_Key'Range loop
+         if J mod 2 = 1 and then J > 1 then
+            --  Skip ':' separators
+            Buffer.Read (Char);
+            pragma Assert (Char = ':');
+         end if;
+         Buffer.Read (Hex_Key (J));
+      end loop;
+
+      Logger.Info ("Derived HKDF key: {0}", Hex_Key);
+
+      Raw := Decoder.Decode_Binary (Hex_Key);
+      AES_Key := Raw (1 .. 32);
+      HMAC_Key := Raw (33 .. 64);
+   end HKDF_Derive_Keys;
 
    ----------------------
    -- Read_ED25519_Key --
@@ -262,16 +463,16 @@ package body Dead_Man_Hand.Decrypt is
       end;
    end Read_ED25519_Key;
 
-   ----------------------
-   -- Write_X25519_Key --
-   ----------------------
+   ------------------------------
+   -- Write_X25519_Private_Key --
+   ------------------------------
 
-   procedure Write_X25519_Key
+   procedure Write_X25519_Private_Key
      (Name : String;
       Key  : Stream_Element_Array_32)
    is
       Output : Ada.Streams.Stream_IO.File_Type;
-      Header : Ada.Streams.Stream_Element_Array (1 .. 16) :=
+      Header : constant Ada.Streams.Stream_Element_Array (1 .. 16) :=
         (16#30#, 16#2E#, 16#02#, 16#01#, 16#00#, 16#30#, 16#05#, 16#06#,
          16#03#, 16#2B#, 16#65#, 16#6E#, 16#04#, 16#22#, 16#04#, 16#20#);
    begin
@@ -282,6 +483,28 @@ package body Dead_Man_Hand.Decrypt is
       Ada.Streams.Stream_IO.Write (Output, Header);
       Ada.Streams.Stream_IO.Write (Output, Key);
       Ada.Streams.Stream_IO.Close (Output);
-   end Write_X25519_Key;
+   end Write_X25519_Private_Key;
+
+   -----------------------------
+   -- Write_X25519_Public_Key --
+   -----------------------------
+
+   procedure Write_X25519_Public_Key
+     (Name : String;
+      Key  : Stream_Element_Array_32)
+   is
+      Output : Ada.Streams.Stream_IO.File_Type;
+      Header : constant Ada.Streams.Stream_Element_Array (1 .. 12) :=
+        (16#30#, 16#2A#, 16#30#, 16#05#, 16#06#, 16#03#,
+         16#2B#, 16#65#, 16#6E#, 16#03#, 16#21#, 16#00#);
+   begin
+      Ada.Streams.Stream_IO.Create
+        (File => Output,
+         Mode => Ada.Streams.Stream_IO.Out_File,
+         Name => Name);
+      Ada.Streams.Stream_IO.Write (Output, Header);
+      Ada.Streams.Stream_IO.Write (Output, Key);
+      Ada.Streams.Stream_IO.Close (Output);
+   end Write_X25519_Public_Key;
 
 end Dead_Man_Hand.Decrypt;

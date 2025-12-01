@@ -3,8 +3,9 @@
 --  SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 ----------------------------------------------------------------
 
-with Ada.Text_IO;
+with Ada.Strings.Unbounded;
 
+with Util.Files;
 with Util.Http.Clients.Curl;
 
 package body Dead_Man_Hand.Fetch is
@@ -30,6 +31,17 @@ package body Dead_Man_Hand.Fetch is
 
       return (if Response.Get_Status = 200 then Response.Get_Body else "");
    end Fetch_User_Data;
+
+   ---------------
+   -- Read_File --
+   ---------------
+
+   function Read_File (File_Name : String) return String is
+      Result : Ada.Strings.Unbounded.Unbounded_String;
+   begin
+      Util.Files.Read_File (File_Name, Result);
+      return Ada.Strings.Unbounded.To_String (Result);
+   end Read_File;
 
 begin
    Util.Http.Clients.Curl.Register;

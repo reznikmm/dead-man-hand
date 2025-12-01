@@ -12,4 +12,6 @@ package Dead_Man_Hand.Fetch is
       Username : String;
       Key_Kind : String) return String;
 
+   function Read_File (File_Name : String) return String;
+
 end Dead_Man_Hand.Fetch;
