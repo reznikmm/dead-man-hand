@@ -9,6 +9,7 @@ with Ada.Strings.Unbounded;
 with Ada.Text_IO;
 with Ada.Directories;
 
+with GNAT.OS_Lib;
 with GNAT.SHA512;
 
 with Util.Encoders.AES;
@@ -51,6 +52,43 @@ package body Dead_Man_Hand.Decrypt is
       Shared_Key : String;
       AES_Key    : out Stream_Element_Array_32;
       HMAC_Key   : out Stream_Element_Array_32);
+
+   function Is_OpenSSH_Private_Key
+     (Logger : Util.Log.Loggers.Logger;
+      Key    : String) return Boolean;
+
+   procedure Copy_Key_File (Key : String);
+
+   -------------------
+   -- Copy_Key_File --
+   -------------------
+
+   procedure Copy_Key_File (Key : String) is
+   begin
+      declare
+         use type GNAT.OS_Lib.String_Access;
+
+         Ok        : Boolean;
+         CP        : constant GNAT.OS_Lib.String_Access :=
+           GNAT.OS_Lib.Locate_Exec_On_Path ("cp");
+         K         : aliased String := Key;
+         P         : aliased String := "-p";
+         V         : aliased String := "-v";
+         Temp      : aliased String := "temp";
+         Arguments : constant GNAT.OS_Lib.Argument_List :=
+           (P'Unchecked_Access,
+            V'Unchecked_Access,
+            K'Unchecked_Access,
+            Temp'Unchecked_Access);
+      begin
+         if CP = null or else CP.all = "" then
+            Ada.Text_IO.Put_Line ("Can't find 'cp' command in PATH!");
+         else
+            GNAT.OS_Lib.Spawn
+              (Program_Name => CP.all, Args => Arguments, Success => Ok);
+         end if;
+      end;
+   end Copy_Key_File;
 
    -------------------
    -- Decode_Base64 --
@@ -101,10 +139,15 @@ package body Dead_Man_Hand.Decrypt is
 
       procedure Remove_Password_And_Read is
          Pipe  : aliased Util.Streams.Pipes.Pipe_Stream;
+
       begin
-         Ada.Directories.Copy_File
-           (Source_Name => Key,
-            Target_Name => "temp");
+         Ada.Text_IO.Put_Line
+           ("Private key seems to be password-protected.");
+         Ada.Text_IO.Put_Line
+           ("I'm going to copy it and run 'ssh-keygen -p' to remove the" &
+            " password. I'll delete the temporary file afterwards.");
+
+         Copy_Key_File (Key);
 
          Ada.Text_IO.Put_Line ("Starting 'ssh-keygen -p'");
          Ada.Text_IO.Put_Line ("It should ask for your private key password!");
@@ -112,6 +155,8 @@ package body Dead_Man_Hand.Decrypt is
          Pipe.Open
            (Command => "ssh-keygen -p -f temp -N ''",
             Mode => Util.Processes.READ);
+
+         Pipe.Close;
 
          Logger.Info
            ("Command exited with status {0}",
@@ -122,7 +167,10 @@ package body Dead_Man_Hand.Decrypt is
             Read_ED25519_Key (Logger, "temp", Private_Key, Success);
             Ada.Directories.Delete_File ("temp");
          else
-            Logger.Info ("Decryption with 'ssh-keygen -p' failed!");
+            Ada.Text_IO.Put_Line ("Unable to remove password from key!");
+            Ada.Text_IO.Put_Line ("Please execute:");
+            Ada.Text_IO.Put_Line ("  ssh-keygen -p -f <keyfile> -N ''");
+            Ada.Text_IO.Put_Line ("And restart with --ed25519-key <keyfile>");
          end if;
       end Remove_Password_And_Read;
 
@@ -186,6 +234,7 @@ package body Dead_Man_Hand.Decrypt is
       end;
 
       if not Success then
+         Ada.Text_IO.Put_Line ("Decryption failed!");
          return;
       end if;
 
@@ -219,7 +268,8 @@ package body Dead_Man_Hand.Decrypt is
          Ada.Streams.Stream_IO.Write (Output, Result (Result'First .. Last));
          Ada.Streams.Stream_IO.Close (Output);
 
-         Logger.Info ("Decryption successful! See 'result-ed.txt'");
+         Ada.Text_IO.Put_Line ("Decryption successful! See 'result-ed.txt'");
+         Ada.Text_IO.New_Line;
       end;
    end Decrypt_ED25519;
 
@@ -241,6 +291,34 @@ package body Dead_Man_Hand.Decrypt is
            ("Can't find private key file " & Key & " does not exist!");
 
          return;
+      elsif Is_OpenSSH_Private_Key (Logger, Key) then
+         Ada.Text_IO.Put_Line
+           ("The private key file " & Key & " is not in PEM format!");
+         Ada.Text_IO.Put_Line
+           ("I make a temporary copy of your key file into './temp'");
+
+         Copy_Key_File (Key);
+
+         declare
+            Pipe : aliased Util.Streams.Pipes.Pipe_Stream;
+         begin
+            Ada.Text_IO.Put_Line ("Now let's turn ./temp into PEM format.");
+            Ada.Text_IO.Put_Line ("  ssh-keygen -p -f temp -m PEM");
+
+            Pipe.Open
+              (Command => "ssh-keygen -p -f temp -m PEM",
+               Mode => Util.Processes.READ);
+
+            Pipe.Close;
+
+            if Pipe.Get_Exit_Status = 0 then
+               Ada.Text_IO.Put_Line ("Conversion to PEM successful!");
+               Decrypt_RSA (Logger, "temp", Text);
+               return;
+            else
+               Ada.Text_IO.Put_Line ("Conversion to PEM failed!");
+            end if;
+         end;
       end if;
 
       Ada.Text_IO.Put_Line ("Starting 'openssl pkeyutl -decrypt'");
@@ -264,9 +342,15 @@ package body Dead_Man_Hand.Decrypt is
          Integer'Image (Pipe.Get_Exit_Status));
 
       if Pipe.Get_Exit_Status = 0 then
-         Logger.Info ("Decryption successful! See 'result-rsa.txt'");
+         Ada.Text_IO.Put_Line ("Decryption successful! See 'result-rsa.txt'");
+         Ada.Text_IO.New_Line;
       else
-         Logger.Info ("Decryption failed!");
+         Ada.Text_IO.Put_Line ("Decryption failed!");
+         Ada.Text_IO.New_Line;
+         Ada.Text_IO.Put_Line ("Make sure your RSA key in PEM format.");
+         Ada.Text_IO.Put_Line ("Please execute:");
+         Ada.Text_IO.Put_Line ("  ssh-keygen -p -f <keyfile> -m PEM");
+         Ada.Text_IO.Put_Line ("And restart with --rsa-key <keyfile>");
       end if;
    end Decrypt_RSA;
 
@@ -325,6 +409,8 @@ package body Dead_Man_Hand.Decrypt is
       end loop;
 
       Logger.Info ("Derived shared key: {0}", Hex);
+      Ada.Directories.Delete_File ("priv.der");
+      Ada.Directories.Delete_File ("pub.der");
    end Derive_Shared_Key;
 
    -----------------------
@@ -351,24 +437,25 @@ package body Dead_Man_Hand.Decrypt is
       AES_Key    : out Stream_Element_Array_32;
       HMAC_Key   : out Stream_Element_Array_32)
    is
-      Pipe  : aliased Util.Streams.Pipes.Pipe_Stream;
-      Buffer : Util.Streams.Buffered.Input_Buffer_Stream;
-      Char : Character;
+      Pipe    : aliased Util.Streams.Pipes.Pipe_Stream;
+      Buffer  : Util.Streams.Buffered.Input_Buffer_Stream;
+      Char    : Character;
       Hex_Key : String (1 .. 128);
-      Raw : Ada.Streams.Stream_Element_Array (1 .. 64);
+      Raw     : Ada.Streams.Stream_Element_Array (1 .. 64);
 
       Decoder : constant Util.Encoders.Decoder :=
         Util.Encoders.Create ("hex");
    begin
       --  Run:
       --  openssl kdf -keylen 64 -kdfopt digest:SHA256
-      --    -kdfopt key:SHARED_KEY -kdfopt info:sealed-box-cbc-protocol HKDF
+      --    -kdfopt hexkey:SHAREDKEY -kdfopt info:sealed-box-cbc-protocol HKDF
       Pipe.Open
         (Command =>
            "openssl kdf -keylen 64 -kdfopt digest:SHA256 "
            & "-kdfopt hexkey:" & Shared_Key & " "
            & "-kdfopt info:sealed-box-cbc-protocol HKDF",
          Mode => Util.Processes.READ);
+
       Buffer.Initialize (Input => Pipe'Unchecked_Access, Size => 200);
       Buffer.Fill;
 
@@ -387,6 +474,35 @@ package body Dead_Man_Hand.Decrypt is
       AES_Key := Raw (1 .. 32);
       HMAC_Key := Raw (33 .. 64);
    end HKDF_Derive_Keys;
+
+   ----------------------------
+   -- Is_OpenSSH_Private_Key --
+   ----------------------------
+
+   function Is_OpenSSH_Private_Key
+     (Logger : Util.Log.Loggers.Logger;
+      Key    : String) return Boolean
+   is
+      Input : Ada.Text_IO.File_Type;
+   begin
+      Ada.Text_IO.Open
+        (File => Input,
+         Mode => Ada.Text_IO.In_File,
+         Name => Key);
+
+      declare
+         Line : constant String := Ada.Text_IO.Get_Line (Input);
+      begin
+         Ada.Text_IO.Close (Input);
+
+         Logger.Info
+           ("First line of key file: {0}",
+            Line);
+
+         return Line =
+           "-----BEGIN OPENSSH PRIVATE KEY-----";
+      end;
+   end Is_OpenSSH_Private_Key;
 
    ----------------------
    -- Read_ED25519_Key --
