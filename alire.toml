@@ -1,0 +1,23 @@
+name = "dead_man_hand"
+description = "A script for secure data transmission"
+version = "0.1.0-dev"
+
+authors = ["Max Reznik"]
+maintainers = ["Max Reznik <reznikmm@gmail.com>"]
+maintainers-logins = ["reznikmm"]
+licenses = "Apache-2.0 WITH LLVM-exception"
+website = ""
+tags = []
+
+executables = ["dead_man_hand"]
+
+project-files = ["gnat/dead_man_hand.gpr"]
+
+[build-switches]
+development.optimization = ["-O0"]
+development.contracts = "Yes"
+development.style_checks = ["-gnaty", "-gnaty-B"]
+"*".debug_info = "Yes"
+
+[[depends-on]]
+utilada_curl = "^2.8.2"
